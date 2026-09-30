@@ -201,8 +201,6 @@ class TestRequestToolApproval:
     def test_api_server_without_exec_ask_remains_fail_closed(self, monkeypatch):
         """An api_server call without an active approval bridge must not run ungated."""
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
-        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(tools_approval_context, "_is_gateway_approval_context", lambda: False)
         monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: False)
         monkeypatch.setattr(tools_approval_context, "_is_cron_approval_context", lambda: False)
         monkeypatch.setattr(approval, "_is_single_query_approval_context", lambda: False)
@@ -215,6 +213,23 @@ class TestRequestToolApproval:
 
         assert res["approved"] is False
         assert "unattended platform" in res["message"].lower()
+
+    def test_a2a_without_human_denies_without_pending_approval(self, monkeypatch):
+        """A2A plugin escalations use unattended_mode=deny instead of queuing approval."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: False)
+        monkeypatch.setattr(tools_approval_context, "_is_cron_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "_is_single_query_approval_context", lambda: False)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_unattended_approval_mode", lambda: "deny")
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "a2a")
+
+        res = request_tool_approval("home_lock", "unlock the front door", rule_key="unlock")
+
+        assert res["approved"] is False
+        assert "unattended platform" in res["message"].lower()
+        assert res.get("status") != "approval_required"
 
     def test_yolo_session_bypasses_gate(self, monkeypatch):
         """A --yolo session skips the plugin approval gate (parity with the

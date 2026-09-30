@@ -858,6 +858,16 @@ class TestWebhookApprovalExclusion:
 
         assert _is_gateway_approval_context() is False
 
+    def test_a2a_platform_returns_false(self, monkeypatch):
+        """A2A sessions are agent-to-agent and cannot answer approval cards."""
+        from tools.approval import _is_gateway_approval_context
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "a2a")
+
+        assert _is_gateway_approval_context() is False
+
     def test_all_unattended_platforms_return_false(self, monkeypatch):
         """Every unattended programmatic platform is excluded, not just webhook."""
         from tools.approval import _is_gateway_approval_context
@@ -972,6 +982,24 @@ class TestWebhookApprovalExclusion:
         result = check_all_command_guards("sudo systemctl restart nginx", "local")
         assert result["approved"] is False
         assert "api_server" in result["message"]
+
+    def test_a2a_dangerous_command_denies_by_default(self, monkeypatch):
+        """A2A dangerous commands deny instantly via approvals.unattended_mode."""
+        from tools.approval import check_all_command_guards
+
+        self._isolate(monkeypatch)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "a2a")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "test-a2a-session")
+
+        result = check_all_command_guards("sudo systemctl restart nginx", "local")
+
+        assert result["approved"] is False
+        assert "unattended platform" in result["message"]
+        assert "approvals.unattended_mode" in result["message"]
+        assert "pending_approval" not in result.get("status", "")
 
     def test_execute_code_denied_on_unattended_platform(self, monkeypatch):
         """execute_code is denied instantly on unattended platforms (parity with cron)."""
