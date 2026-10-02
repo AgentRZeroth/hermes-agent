@@ -78,11 +78,12 @@ class TestConnectionGateScope:
         assert seen == [(True, True), (False, False), (True, True)]
 
     def test_standalone_profile_reads_its_own_environ(self, monkeypatch):
-        """T1 (no multiplex): os.environ IS the profile — A2A_PORT there enables; ``extra.enabled`` always wins."""
+        """T1 (no multiplex): explicit config or the profile's own A2A_PORT enables inbound A2A."""
         from plugins.platforms import a2a
 
         monkeypatch.delenv("A2A_PORT", raising=False)
         assert a2a.is_connected(SimpleNamespace(extra={})) is False
+        assert a2a.is_connected(SimpleNamespace(enabled=True, extra={"port": 19901})) is True
         assert a2a.is_connected(SimpleNamespace(extra={"enabled": True})) is True
         monkeypatch.setenv("A2A_PORT", "9902")
         assert a2a.is_connected(SimpleNamespace(extra={})) is True

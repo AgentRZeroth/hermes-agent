@@ -40,7 +40,7 @@ def is_connected(config) -> bool:
     ``bind_failed`` (#122126).
     """
     extra = getattr(config, "extra", {}) or {}
-    if extra.get("enabled"):
+    if getattr(config, "enabled", False) or extra.get("enabled"):
         return True
     from gateway.platforms._shared import env_is_connected
 
