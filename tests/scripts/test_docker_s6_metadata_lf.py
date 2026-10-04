@@ -40,6 +40,12 @@ class DockerRuntimeMetadataLfTest(unittest.TestCase):
             by_path,
             {path: {"text": "set", "eol": "lf"} for path in tracked},
         )
+        for path in tracked:
+            self.assertNotIn(
+                b"\r",
+                (REPO_ROOT / path).read_bytes(),
+                f"{path} contains CR bytes in the Docker build context",
+            )
 
 
 if __name__ == "__main__":
