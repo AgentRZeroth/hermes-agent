@@ -4,18 +4,22 @@ import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-S6_ROOT = "docker/s6-rc.d"
+DOCKER_RUNTIME_ROOTS = ("docker/s6-rc.d", "docker/cont-init.d")
 
 
-class DockerS6MetadataLfTest(unittest.TestCase):
-    def test_docker_s6_metadata_files_are_checked_out_with_lf(self):
-        tracked = subprocess.run(
-            ["git", "ls-files", S6_ROOT],
-            cwd=REPO_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
+class DockerRuntimeMetadataLfTest(unittest.TestCase):
+    def test_docker_runtime_metadata_files_are_checked_out_with_lf(self):
+        tracked = []
+        for root in DOCKER_RUNTIME_ROOTS:
+            tracked.extend(
+                subprocess.run(
+                    ["git", "ls-files", root],
+                    cwd=REPO_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+            )
 
         self.assertTrue(tracked)
 
