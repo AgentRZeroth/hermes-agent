@@ -34,7 +34,8 @@ def _configured_peers() -> dict:
 
 def _peer_from_entry(entry: dict, **extra: Any) -> dict:
     return {"url": entry.get("url", ""), "auth": entry.get("auth", {}) or {},
-            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
+            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
+            "tenant": entry.get("tenant", ""), **extra}
 
 
 def _resolve_peer(agent: str) -> Optional[dict]:
@@ -99,8 +100,10 @@ def _rpc_url(base_url: str, card: Optional[dict]) -> str:
 
 
 def _tenant(peer: dict, card: Optional[dict]) -> str:
+    if peer.get("tenant"):
+        return str(peer["tenant"])
     iface = _select_jsonrpc_interface(card)
-    return str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
+    return str(iface["tenant"]) if iface and iface.get("tenant") else ""
 
 
 def _rpc_body(method: str, ctx: str, message: str = "", tenant: str = "", task_id: str = "") -> dict:

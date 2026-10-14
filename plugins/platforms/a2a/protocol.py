@@ -5,6 +5,7 @@ Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -18,6 +19,10 @@ from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 from hermes_constants import get_hermes_home
+
+# Pending-task persistence is serialized within this process.  Atomic replacement
+# prevents readers from observing partial JSON, but does not coordinate processes.
+_PENDING_TASKS_LOCK = threading.RLock()
 
 PROTOCOL_VERSION = "1.0"
 
@@ -480,16 +485,20 @@ def save_pending_task(record: dict) -> None:
     if not safe["task_id"]:
         return
     try:
-        path = _pending_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existing = load_pending_tasks()
-        existing[safe["task_id"]] = safe
-        path.write_text(json.dumps(existing, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        with _PENDING_TASKS_LOCK:
+            existing = _load_pending_tasks_unlocked()
+            existing[safe["task_id"]] = safe
+            _write_pending_tasks_unlocked(existing)
     except Exception:
         pass
 
 
 def load_pending_tasks() -> dict[str, dict]:
+    with _PENDING_TASKS_LOCK:
+        return _load_pending_tasks_unlocked()
+
+
+def _load_pending_tasks_unlocked() -> dict[str, dict]:
     try:
         raw = json.loads(_pending_path().read_text(encoding="utf-8-sig"))
         return {str(k): v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
@@ -497,11 +506,37 @@ def load_pending_tasks() -> dict[str, dict]:
         return {}
 
 
+def _write_pending_tasks_unlocked(tasks: dict[str, dict]) -> None:
+    """Atomically replace the pending-task file while holding _PENDING_TASKS_LOCK."""
+    path = _pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as fh:
+            json.dump(tasks, fh, ensure_ascii=False, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # Windows can transiently deny replacement while a concurrent reader has
+        # the destination open.  Keep the serialized write rather than dropping it.
+        for attempt in range(20):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.001)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
 def remove_pending_task(task_id: str) -> None:
     try:
-        tasks = load_pending_tasks()
-        if task_id in tasks:
-            tasks.pop(task_id)
-            _pending_path().write_text(json.dumps(tasks, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        with _PENDING_TASKS_LOCK:
+            tasks = _load_pending_tasks_unlocked()
+            if task_id in tasks:
+                tasks.pop(task_id)
+                _write_pending_tasks_unlocked(tasks)
     except Exception:
         pass

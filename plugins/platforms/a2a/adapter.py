@@ -40,6 +40,10 @@ _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaus
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 _DEFAULT_DESCRIPTION = "Hermes Agent — a general-purpose agent reachable over A2A."
 
+
+class _StreamDisconnected(Exception):
+    """An SSE write failed; this only detaches the HTTP client from its live task."""
+
 _ok = protocol.jsonrpc_result
 _err = protocol.jsonrpc_error
 
@@ -645,6 +649,24 @@ class A2AAdapter(BasePlatformAdapter):
         finally:
             self._pop_pending(task_id)
 
+    def _finalize_when_ready(self, pending: dict) -> None:
+        """Finish an orphaned HTTP stream when its gateway future resolves.
+
+        The task is deliberately not subject to the request's reply timeout: a disconnect
+        detaches only the stream, while the gateway owns the live task's eventual outcome.
+        """
+        if pending.get("background_finalizer"):
+            return
+        pending["background_finalizer"] = True
+
+        def finalize(fut: Future, task: dict = pending) -> None:
+            try:
+                self._finalize_task(task, *fut.result())
+            except Exception:
+                logger.exception("A2A: could not finalize disconnected stream task")
+
+        pending["future"].add_done_callback(finalize)
+
     @staticmethod
     def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
         """Block until ``fut`` resolves or ``deadline`` passes (-> ``on_timeout``). ``keepalive`` runs
@@ -659,7 +681,7 @@ class A2AAdapter(BasePlatformAdapter):
                     try:
                         keepalive()
                     except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                        raise _StreamDisconnected
             except Exception:
                 return on_timeout
 
@@ -718,16 +740,11 @@ class A2AAdapter(BasePlatformAdapter):
             state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
-        except (BrokenPipeError, ConnectionResetError):
+        except (_StreamDisconnected, BrokenPipeError, ConnectionResetError):
             if pending is not None:
                 # The HTTP response is gone, not the task.  Leave its pending future for
                 # gateway completion / GetTask / a later SubscribeToTask.
-                def finalize_when_ready(fut: Future, task: dict = pending) -> None:
-                    try:
-                        self._finalize_task(task, *fut.result())
-                    except Exception:
-                        logger.exception("A2A: could not finalize disconnected stream task")
-                pending["future"].add_done_callback(finalize_when_ready)
+                self._finalize_when_ready(pending)
                 pending = None
             logger.debug("A2A: stream client disconnected")
 

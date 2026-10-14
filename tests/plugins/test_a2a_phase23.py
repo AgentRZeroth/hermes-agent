@@ -580,6 +580,57 @@ class TestTaskStore:
         assert "t-live" in adapter._pending
         assert "t-live" in adapter._active_tasks
 
+    def test_keepalive_disconnect_detaches_then_future_completes(self, monkeypatch):
+        """A broken keepalive must not turn a still-running gateway task into failure."""
+        from plugins.platforms.a2a import adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "_SSE_KEEPALIVE", 0.01)
+        adapter, _base = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("t-live", "c1", "peer")
+        adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
+        future = adapter._add_pending("t-live", "c1")
+        pending = {
+            "task_id": "t-live", "context_id": "c1", "peer": "peer", "future": future,
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+
+        class Writer:
+            writes = 0
+
+            def write(self, _chunk):
+                self.writes += 1
+                if self.writes == 3:  # submitted, working, then keepalive
+                    raise BrokenPipeError
+
+            def flush(self):
+                pass
+
+        class Handler:
+            wfile = Writer()
+
+            def send_response(self, _status):
+                pass
+
+            def send_header(self, _name, _value):
+                pass
+
+            def end_headers(self):
+                pass
+
+        adapter._rpc_message_stream(Handler(), 1, {}, "peer")
+        stored = adapter.tasks.get("t-live")
+        assert stored is not None
+        assert stored["state"] == protocol.STATE_WORKING
+        assert "t-live" in adapter._pending
+        future.set_result((protocol.STATE_COMPLETED, "eventual reply"))
+        watched = adapter.tasks.watch("t-live")
+        assert watched is not None
+        assert watched.result(timeout=1) == (protocol.STATE_COMPLETED, "eventual reply")
+        task = adapter._rpc_tasks_get(2, {"taskId": "t-live"})["result"]
+        assert task["status"]["state"] == protocol.STATE_COMPLETED
+        assert protocol.extract_text(task["status"]["message"]) == "eventual reply"
+
     def test_list_newest_first_with_filters(self):
         store = protocol.TaskStore()
         store.create("t1", "c1", "p")
@@ -673,6 +724,58 @@ class TestA2AOrchestrate:
         out = tools.a2a_orchestrate({"capability": "research", "message": "go"})
         assert "reply from researcher" in out
         assert "reply from generalist" in out
+
+    def test_orchestrate_preserves_configured_tenant(self, monkeypatch):
+        entry = {"url": "http://peer", "capabilities": ["research"], "tenant": "configured-tenant"}
+        captured = {}
+
+        monkeypatch.setattr(tools, "_fetch_card", lambda *_args: {
+            "url": "http://peer/rpc", "supportedInterfaces": [{
+                "url": "http://peer/rpc", "protocolBinding": "JSONRPC", "tenant": "remote-card-tenant",
+            }], "capabilities": {"streaming": False},
+        })
+
+        def post(_url, body, _headers, _timeout):
+            captured.update(body)
+            return {"result": {"contextId": "ctx", "status": {
+                "state": protocol.STATE_COMPLETED, "message": protocol.text_message(protocol.ROLE_AGENT, "ok"),
+            }}}
+
+        monkeypatch.setattr(tools, "_http_post_json", post)
+        assert tools._call_peer_sync("peer", entry, "go") == ("peer", "ok")
+        assert captured["params"]["tenant"] == "configured-tenant"
+
+
+class TestPendingTaskPersistence:
+    def test_concurrent_saves_preserve_every_record_and_valid_json(self, monkeypatch, tmp_path):
+        path = tmp_path / "a2a_pending_tasks.json"
+        monkeypatch.setattr(protocol, "_pending_path", lambda: path)
+        count, start, errors = 40, threading.Barrier(41), []
+
+        def save(index):
+            start.wait()
+            protocol.save_pending_task({"agent": "peer", "task_id": f"task-{index}", "context_id": f"ctx-{index}"})
+
+        threads = [threading.Thread(target=save, args=(index,)) for index in range(count)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        while any(thread.is_alive() for thread in threads):
+            try:
+                json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except json.JSONDecodeError as exc:
+                errors.append(exc)
+            except PermissionError:
+                # Windows can briefly deny an external open while os.replace runs;
+                # every successful read must still be complete JSON.
+                pass
+            time.sleep(0.001)
+        for thread in threads:
+            thread.join()
+        saved = protocol.load_pending_tasks()
+        assert not errors
+        assert set(saved) == {f"task-{index}" for index in range(count)}
+        assert json.loads(path.read_text(encoding="utf-8")) == saved
 
     def test_best_mode_picks_longest_success(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config", lambda: _TWO_PEERS)
