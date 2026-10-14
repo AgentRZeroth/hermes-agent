@@ -616,6 +616,10 @@ class A2AAdapter(BasePlatformAdapter):
     def _record_outcome(self, task_id: str, context_id: str, peer: str, state: str, reply: str,
                         started: Optional[float] = None) -> None:
         """Persist + audit + count a finished task, mark it terminal, and fire its push callback."""
+        # Only the winner of the terminal transition records side effects.  A disconnected
+        # SSE response can race the normal gateway completion.
+        if self.tasks.complete(task_id, state, reply) is None:
+            return
         protocol.persist_message(context_id, "agent", reply, task_id)
         security.audit("outbound", peer, task_id, reply)
         m = protocol.metrics
@@ -625,7 +629,6 @@ class A2AAdapter(BasePlatformAdapter):
                 m.record_latency(time.time() - started)
         else:
             m.tasks_failed += 1
-        self.tasks.complete(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
@@ -717,7 +720,15 @@ class A2AAdapter(BasePlatformAdapter):
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
-                self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
+                # The HTTP response is gone, not the task.  Leave its pending future for
+                # gateway completion / GetTask / a later SubscribeToTask.
+                def finalize_when_ready(fut: Future, task: dict = pending) -> None:
+                    try:
+                        self._finalize_task(task, *fut.result())
+                    except Exception:
+                        logger.exception("A2A: could not finalize disconnected stream task")
+                pending["future"].add_done_callback(finalize_when_ready)
+                pending = None
             logger.debug("A2A: stream client disconnected")
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:

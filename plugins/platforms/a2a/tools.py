@@ -64,6 +64,12 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     return _http_json(url, hdrs, timeout, "POST", json.dumps(body).encode("utf-8"))
 
 
+def _http_post_sse(url: str, body: dict, headers: dict, timeout: int):
+    """Open an SSE request.  Callers close it as soon as a durable task id is known."""
+    hdrs = {"Content-Type": "application/json", "Accept": "text/event-stream", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
+    return urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=hdrs, method="POST"), timeout=timeout)
+
+
 def _fetch_card(base_url: str, headers: dict, timeout: int) -> dict:
     """GET the v1.0 agent-card.json; on 404 fall back to the v0.2 agent.json alias."""
     base = base_url.rstrip("/")
@@ -92,6 +98,43 @@ def _rpc_url(base_url: str, card: Optional[dict]) -> str:
     return base_url.rstrip("/")
 
 
+def _tenant(peer: dict, card: Optional[dict]) -> str:
+    iface = _select_jsonrpc_interface(card)
+    return str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
+
+
+def _rpc_body(method: str, ctx: str, message: str = "", tenant: str = "", task_id: str = "") -> dict:
+    params: dict[str, Any] = {"taskId": task_id} if task_id else {"message": protocol.text_message(protocol.ROLE_USER, message, context_id=ctx)}
+    if tenant:
+        params["tenant"] = tenant
+    return {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": method, "params": params}
+
+
+def _stream_task(agent: str, peer: dict, rpc_url: str, body: dict, ctx: str, tenant: str) -> tuple[str, str, str]:
+    """Return once a stream exposes its task identity; never hold the model tool open for completion."""
+    response = _http_post_sse(rpc_url, body, _auth_header(peer.get("auth", {}) or {}), min(int(peer.get("timeout", _DEFAULT_TIMEOUT)), 30))
+    task_id, state = "", protocol.STATE_WORKING
+    try:
+        for raw in response:
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            event = json.loads(line[5:].strip())
+            event = event.get("result", event) if isinstance(event, dict) else {}
+            task = event.get("task", {}) if isinstance(event, dict) else {}
+            update = event.get("statusUpdate", {}) if isinstance(event, dict) else {}
+            task_id = str(task.get("id") or update.get("taskId") or task_id)
+            ctx = str(task.get("contextId") or update.get("contextId") or ctx)
+            state = str((task.get("status") or update.get("status") or {}).get("state") or state)
+            if task_id:
+                protocol.save_pending_task({"agent": agent, "rpc_url": rpc_url, "peer_url": peer.get("url", ""),
+                                            "tenant": tenant, "context_id": ctx, "task_id": task_id, "state": state})
+                return "", ctx, state
+    finally:
+        response.close()
+    raise ValueError("streaming peer ended before providing a task id")
+
+
 def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> tuple[str, str, str]:
     """One SendMessage to a peer -> (reply_text, context_id, state). Raises urllib errors /
     ValueError for the caller to format; handles redaction, audit, persistence, metrics."""
@@ -105,16 +148,19 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
-    rpc_body = {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": "SendMessage",
-                "params": {"message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx)}}
-    iface = _select_jsonrpc_interface(card)
-    tenant = str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
-    if tenant:
-        rpc_body["params"]["tenant"] = tenant
+    tenant = _tenant(peer, card)
+    rpc_body = _rpc_body("SendMessage", ctx, safe_message, tenant)
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    rpc_url = _rpc_url(base_url, card)
+    if isinstance(card, dict) and (card.get("capabilities") or {}).get("streaming"):
+        try:
+            return _stream_task(agent_label, peer, rpc_url, _rpc_body("SendStreamingMessage", ctx, safe_message, tenant), ctx, tenant)
+        except (ValueError, urllib.error.HTTPError):
+            # Older peers occasionally advertise streaming but expose only SendMessage.
+            pass
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout)
     if "error" in resp:
         raise ValueError(f"Peer '{agent_label}' returned an error: {resp['error'].get('message', resp['error'])}")
     payload = protocol.unwrap_send_message_response(resp.get("result", {}))
@@ -123,6 +169,10 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     if isinstance(payload, dict):
         reply_ctx = payload.get("contextId", ctx)
         state = (payload.get("status") or {}).get("state", "")
+        task_id = payload.get("id", "")
+        if task_id and state not in protocol.TERMINAL_STATES:
+            protocol.save_pending_task({"agent": agent_label, "rpc_url": rpc_url, "peer_url": base_url, "tenant": tenant,
+                                        "context_id": reply_ctx, "task_id": task_id, "state": state})
     protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])
     protocol.metrics.inbound_total += 1
     return reply, reply_ctx, state
@@ -169,19 +219,50 @@ def a2a_discover(args: dict, **_: Any) -> str:
     return "\n".join(lines)
 
 
+def _resume_task(agent: str, peer: dict, task_id: str) -> tuple[str, str, str]:
+    saved = protocol.load_pending_tasks().get(task_id, {})
+    base_url = str(saved.get("peer_url") or peer.get("url") or "")
+    headers = _auth_header(peer.get("auth", {}) or {})
+    tenant = str(saved.get("tenant") or peer.get("tenant") or "")
+    rpc_url = str(saved.get("rpc_url") or base_url)
+    body = _rpc_body("GetTask", "", tenant=tenant, task_id=task_id)
+    payload = _http_post_json(rpc_url, body, headers, min(int(peer.get("timeout", _DEFAULT_TIMEOUT)), 30))
+    if "error" in payload:
+        raise ValueError(f"Peer '{agent}' returned an error: {payload['error'].get('message', payload['error'])}")
+    task = payload.get("result", {})
+    ctx, state = str(task.get("contextId") or saved.get("context_id") or ""), str((task.get("status") or {}).get("state") or "")
+    reply = _reply_text_from_result(task)
+    if state in protocol.TERMINAL_STATES:
+        protocol.remove_pending_task(task_id)
+    else:
+        protocol.save_pending_task({**saved, "agent": agent, "rpc_url": rpc_url, "peer_url": base_url, "tenant": tenant,
+                                    "context_id": ctx, "task_id": task_id, "state": state})
+        # A peer may offer SubscribeToTask but still close it immediately after its
+        # status replay.  Use it as the preferred reconnect transport; GetTask above
+        # remains the portable bounded polling fallback.
+        try:
+            _stream_task(agent, peer, rpc_url, _rpc_body("SubscribeToTask", "", tenant=tenant, task_id=task_id), ctx, tenant)
+        except (ValueError, urllib.error.HTTPError):
+            pass
+    return reply, ctx, state
+
+
 def a2a_call(args: dict, **_: Any) -> str:
     """Send a task to a peer (configured name or direct URL); ``context_id`` continues a prior exchange."""
     # Accept common aliases models reach for (observed live: 'agent_name').
     agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
     message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
-    if not agent or not message:
-        return "Error: both 'agent' and 'message' are required."
+    task_id = str(args.get("task_id") or args.get("taskId") or "").strip()
+    if task_id and not agent:
+        agent = str(protocol.load_pending_tasks().get(task_id, {}).get("agent") or "").strip()
+    if not agent or (not message and not task_id):
+        return "Error: 'agent' and either 'message' or 'task_id' are required."
     peer = _resolve_peer(agent)
     if not peer or not peer.get("url"):
         return f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in config.yaml or pass a full http(s):// URL."
     try:
-        reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
+        reply, reply_ctx, state = _resume_task(agent, peer, task_id) if task_id else _send_task(agent, peer, message, context_id)
     except urllib.error.HTTPError as e:
         return _HTTP_CALL_ERRORS.get(e.code, "Error: call to '{agent}' failed — HTTP {code}.").format(agent=agent, code=e.code)
     except ValueError as e:
@@ -189,10 +270,12 @@ def a2a_call(args: dict, **_: Any) -> str:
     except Exception as e:
         return f"Error: call to '{agent}' failed — {e}."
     short_state = state.replace("TASK_STATE_", "").replace("_", "-").lower()  # v0.3 states pass through
-    header = f"[{agent} · context {reply_ctx}" + (f" · {short_state}" if state else "") + "]"
+    header = f"[{agent} · context {reply_ctx}" + (f" · task {task_id}" if task_id else "") + (f" · {short_state}" if state else "") + "]"
     body = reply or "(no text reply)"
     if state == protocol.STATE_INPUT_REQUIRED:
         body += f"\n\n(The peer needs more input — answer by calling a2a_call again with context_id '{reply_ctx}'.)"
+    if not reply and state not in protocol.TERMINAL_STATES:
+        body = f"still running; resume with a2a_call(agent='{agent}', task_id='{task_id or next((tid for tid, rec in protocol.load_pending_tasks().items() if rec.get('context_id') == reply_ctx), '')}')."
     return f"{header}\n{body}"
 
 
@@ -212,6 +295,10 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
         lines.append("")
         lines.append(f"Persisted conversations ({len(convos)}) — recall with a2a_history:")
         lines.extend(f"  - {c}" for c in convos[:25])
+    if pending := protocol.load_pending_tasks():
+        lines.append("")
+        lines.append(f"Pending tasks ({len(pending)}) — resume with a2a_call(task_id=...):")
+        lines.extend(f"  - {tid}: {rec.get('agent', '?')} context {rec.get('context_id', '?')} ({rec.get('state', '?')})" for tid, rec in pending.items())
     m = protocol.metrics.snapshot()
     lines.append("")
     lines.append(f"Metrics: {m['inbound_total']} in / {m['outbound_total']} out, {m['tasks_completed']} completed, "
@@ -245,7 +332,11 @@ def _match_peers_by_capability(capability: str) -> list[tuple[str, dict]]:
 def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id: str = "") -> tuple[str, str]:
     """Call a single peer synchronously -> (agent_name, reply_text)."""
     try:
-        reply, _ctx, _state = _send_task(agent_name, _peer_from_entry(peer_entry), message, context_id)
+        reply, reply_ctx, state = _send_task(agent_name, _peer_from_entry(peer_entry), message, context_id)
+        if not reply and state not in protocol.TERMINAL_STATES:
+            task_id = next((tid for tid, rec in protocol.load_pending_tasks().items()
+                            if rec.get("agent") == agent_name and rec.get("context_id") == reply_ctx), "")
+            reply = f"still running; context_id={reply_ctx} task_id={task_id}"
         return (agent_name, reply or "(no reply)")
     except Exception as e:
         return (agent_name, f"Error: {e}")
@@ -300,13 +391,14 @@ _TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
                      "capabilities, and skills). Use this to find out what a remote agent can do before calling it.",
                      {"url": _str("Base URL of the remote A2A agent, e.g. http://localhost:9999")}, ["url"]),
     "a2a_call": (a2a_call,
-                 "Send a natural-language task to a remote A2A agent and return its reply. The agent is a peer "
+                 "Send a natural-language task to a remote A2A agent and return its reply, or resume a durable task. The agent is a peer "
                  "(any A2A-compliant framework), not a sub-agent you control. Pass 'context_id' from a previous "
                  "reply to continue a multi-turn exchange.",
                  {"agent": _str("Configured peer name (from a2a_agents) or a full http(s):// URL."),
                   "message": _str("The task / message to send the peer, in natural language."),
-                  "context_id": _str("Optional: context id from a prior reply, to continue the conversation.")},
-                 ["agent", "message"]),
+                  "context_id": _str("Optional: context id from a prior reply, to continue a conversation."),
+                  "task_id": _str("Optional: durable task id to resume; message is not required when provided.")},
+                 []),
     "a2a_list": (a2a_list, "List configured A2A peer agents, persisted A2A conversations, and metrics.", {}, []),
     "a2a_history": (a2a_history,
                     "Recall a persisted A2A conversation transcript by context_id (survives restarts and "

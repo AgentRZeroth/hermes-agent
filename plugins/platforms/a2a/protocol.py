@@ -467,3 +467,41 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
 def list_conversations() -> list[str]:
     """Context-ids that have persisted conversations."""
     return sorted(p.stem for p in (get_hermes_home() / "a2a_conversations").glob("*.jsonl"))
+
+
+def _pending_path() -> Path:
+    return get_hermes_home() / "a2a_pending_tasks.json"
+
+
+def save_pending_task(record: dict) -> None:
+    """Durably record only the routing identity needed to resume an outbound task."""
+    allowed = ("agent", "rpc_url", "peer_url", "tenant", "context_id", "task_id", "state")
+    safe = {key: str(record.get(key) or "") for key in allowed}
+    if not safe["task_id"]:
+        return
+    try:
+        path = _pending_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = load_pending_tasks()
+        existing[safe["task_id"]] = safe
+        path.write_text(json.dumps(existing, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_pending_tasks() -> dict[str, dict]:
+    try:
+        raw = json.loads(_pending_path().read_text(encoding="utf-8-sig"))
+        return {str(k): v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def remove_pending_task(task_id: str) -> None:
+    try:
+        tasks = load_pending_tasks()
+        if task_id in tasks:
+            tasks.pop(task_id)
+            _pending_path().write_text(json.dumps(tasks, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass

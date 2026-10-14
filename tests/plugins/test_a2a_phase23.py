@@ -575,10 +575,10 @@ class TestTaskStore:
         adapter._rpc_message_stream(Handler(), 1, {}, "peer")
 
         stored = adapter.tasks.get("t-live")
-        assert stored["state"] == protocol.STATE_FAILED
-        assert stored["reply"] == "[client disconnected]"
-        assert "t-live" not in adapter._pending
-        assert "t-live" not in adapter._active_tasks
+        assert stored["state"] == protocol.STATE_WORKING
+        assert stored["reply"] == ""
+        assert "t-live" in adapter._pending
+        assert "t-live" in adapter._active_tasks
 
     def test_list_newest_first_with_filters(self):
         store = protocol.TaskStore()
