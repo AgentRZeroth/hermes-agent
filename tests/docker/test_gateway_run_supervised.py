@@ -20,11 +20,17 @@ docstring; see ``tests/docker/conftest.py`` for rationale.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import time
+from pathlib import Path
+
+import pytest
+from hermes_cli._parser import command_argv
 
 from tests.docker.conftest import (
     docker_exec_sh,
+    poll_container,
     start_container,
     wait_for_docker_logs,
 )
@@ -97,12 +103,11 @@ def test_gateway_run_redirects_to_supervised(
       * Confirming the CMD process is sleeping (not python/gateway).
       * Confirming ``s6-svstat gateway-default`` reports want-up.
     """
-    # Start the container detached using the historical gateway-run
-    # pattern. The redirect should fire and the container should NOT
-    # exit immediately (which is what would happen pre-this-PR on the
-    # s6 image — the foreground gateway would crash without config,
-    # the CMD would exit, /init would shut down).
-    start_container(built_image, container_name, cmd="gateway run")
+    # Start a real API listener as well as the historical gateway-run path:
+    # a want-up slot alone would not catch a boot that never reaches serving.
+    start_container(
+        built_image, container_name, "API_SERVER_ENABLED=true", cmd="gateway run",
+    )
 
     # Wait for the redirect breadcrumb to appear in docker logs.
     # Under heavy parallel load (32-way docker test fan-out), the CMD
@@ -143,6 +148,30 @@ def test_gateway_run_redirects_to_supervised(
         f"gateway-default slot want-state not up: {_svstat(container_name)!r}"
     )
 
+    # cont-init runs after stage2 has initialized /opt/data but before s6
+    # launches this CMD.  The home therefore exists without a legacy state
+    # file at reconciliation time — the exact upgrade shape that previously
+    # registered gateway-default DOWN.  The entrypoint declaration must seed
+    # explicit run intent before the slot is registered.
+    state = docker_exec_sh(container_name, "cat /opt/data/gateway_state.json")
+    assert state.returncode == 0, f"state read failed: {state.stderr!r}"
+    state_payload = json.loads(state.stdout)
+    assert state_payload["desired_state"] == "running", state.stdout
+    assert state_payload["migrated_from"] == "legacy-container-cmd", state.stdout
+    marker = docker_exec_sh(
+        container_name, "test ! -e /run/hermes/container-gateway-run", user="root",
+    )
+    assert marker.returncode == 0, "cont-init must consume the pre-init marker"
+
+    # A live TCP listener closes the remaining gap between supervision intent
+    # and an actually-serving gateway.  0x21c2 is the hexadecimal port 8642.
+    listening, _ = poll_container(
+        container_name,
+        "grep -qi ':21C2' /proc/net/tcp /proc/net/tcp6",
+        deadline_s=60.0,
+    )
+    assert listening, "gateway API listener on 8642 never appeared"
+
     # The CMD process (PID under /init that the wrapper exec'd into)
     # should be sleeping, not the gateway. We count `sleep infinity`
     # processes parented to the CMD wrapper (main-wrapper.sh / rc.init
@@ -163,6 +192,175 @@ def test_gateway_run_redirects_to_supervised(
         f"wrapper (the redirect); found {redirected_sleeps}. "
         f"ps:\n{docker_exec_sh(container_name, 'ps -eo pid,ppid,cmd').stdout}"
     )
+
+
+def test_profile_prefixed_gateway_run_seeds_and_consumes_boot_marker(
+    built_image: str, container_name: str,
+) -> None:
+    """A top-level profile option still declares supervised gateway intent.
+
+    This exercises the real entrypoint → /init → cont-init transport, not
+    merely the Python argv fallback.  Consumption proves a marker cannot leak
+    into a later reconciliation pass.
+    """
+    start_container(built_image, container_name, cmd="--profile coder gateway run")
+
+    logs = wait_for_docker_logs(
+        container_name, "reconcile: profile=default prior_state=running action=started", deadline_s=60.0,
+    )
+    assert "prior_state=running action=started" in logs, logs
+    state = docker_exec_sh(container_name, "cat /opt/data/gateway_state.json")
+    assert state.returncode == 0
+    assert json.loads(state.stdout)["desired_state"] == "running"
+
+
+def test_ambient_gateway_marker_cannot_seed_an_unrelated_command(
+    built_image: str, container_name: str,
+) -> None:
+    """An operator-supplied compatibility env var must not spoof CMD intent."""
+    start_container(
+        built_image, container_name, "HERMES_CONTAINER_GATEWAY_RUN=1", cmd="sleep infinity",
+    )
+
+    logs = wait_for_docker_logs(
+        container_name, "reconcile: profile=default prior_state=None action=registered", deadline_s=60.0,
+    )
+    assert "prior_state=None action=registered" in logs, logs
+    state = docker_exec_sh(container_name, "test ! -e /opt/data/gateway_state.json")
+    assert state.returncode == 0, "ambient marker must not create run intent"
+
+
+@pytest.mark.parametrize(("argv", "expected"), [
+    pytest.param(["-c", "gateway", "run"], False, id="short-continue-optional-value"),
+    pytest.param(["--continue", "gateway", "run"], False, id="long-continue-optional-value"),
+    pytest.param(["--continue", "named", "gateway", "run"], True, id="named-continue"),
+    pytest.param(["--profile", "coder", "gateway", "run"], True, id="profile-prefix"),
+    pytest.param(["--model", "gateway", "run"], False, id="required-option-value"),
+    pytest.param(["--model=gateway", "run"], False, id="equal-form-option-value"),
+    pytest.param(["--", "gateway", "run"], True, id="double-dash"),
+    pytest.param(["gateway", "run", "--no-supervise"], False, id="cli-opt-out"),
+])
+def test_entrypoint_classifier_matches_canonical_parser(
+    argv: list[str], expected: bool,
+) -> None:
+    """The PID1 shell delegates command classification to command_argv.
+
+    This matrix pins the awkward optional-value and equals forms which caused
+    shell/parser drift. The source assertion makes the parity contract
+    explicit: the shell must invoke the same canonical classifier, not copy
+    this table in a second parser.
+    """
+    source = (Path(__file__).parents[2] / "docker" / "entrypoint-dispatch.sh").read_text()
+    assert "from hermes_cli._parser import command_argv" in source
+    assert "command = command_argv(sys.argv[1:])" in source
+    actual = command_argv(argv)[:2] == ["gateway", "run"] and "--no-supervise" not in argv
+    assert actual is expected
+
+
+def test_pid1_classifier_failure_fails_closed_before_init(
+    built_image: str,
+) -> None:
+    """A broken PID1 classifier must not silently continue into ``/init``.
+
+    The dispatcher is exec'd by the shell, so it retains Docker PID 1.  The
+    temporary ``/init`` probe would print a sentinel if execution reached it;
+    removing the classifier module forces its import to fail while Python
+    itself remains available.
+    """
+    script = " ".join((
+        "mv /opt/hermes/hermes_cli/_parser.py /opt/hermes/hermes_cli/_parser.py.disabled;",
+        "mv /init /init.real;",
+        "printf '#!/bin/sh\\necho INIT-LAUNCHED >&2\\nexit 0\\n' >/init;",
+        "chmod 0755 /init;",
+        "exec /opt/hermes/docker/entrypoint-dispatch.sh gateway run",
+    ))
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", built_image, "-c", script],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    output = r.stdout + r.stderr
+    assert r.returncode != 0, output
+    assert "[hermes] ERROR: gateway intent classifier failed" in output
+    assert "INIT-LAUNCHED" not in output, output
+
+
+@pytest.mark.parametrize("setup", [
+    pytest.param("ln -s /etc/passwd /run/hermes/container-gateway-run", id="symlink"),
+    pytest.param("touch /run/hermes/container-gateway-run; chmod 0644 /run/hermes/container-gateway-run", id="wrong-mode"),
+    pytest.param("touch /run/hermes/container-gateway-run; chown 0:10000 /run/hermes/container-gateway-run", id="wrong-gid"),
+])
+def test_reconciler_rejects_invalid_root_private_gateway_marker(
+    built_image: str, container_name: str, setup: str,
+) -> None:
+    """Malformed marker transport fails closed rather than accepting spoofed intent."""
+    start_container(built_image, container_name)
+    r = docker_exec_sh(
+        container_name,
+        f"rm -rf /run/hermes; install -d -m 0700 /run/hermes; {setup}; "
+        "sh /etc/cont-init.d/02-reconcile-profiles",
+        user="root",
+    )
+    assert r.returncode != 0
+    assert "invalid pre-init gateway marker" in r.stderr
+
+
+def test_reconciler_retains_marker_when_reconciliation_fails(
+    built_image: str, container_name: str,
+) -> None:
+    """A valid marker is consumed only after a successful reconciliation."""
+    start_container(built_image, container_name)
+    r = docker_exec_sh(
+        container_name,
+        "install -d -m 0700 /run/hermes; install -m 0600 /dev/null "
+        "/run/hermes/container-gateway-run; HERMES_HOME=/proc "
+        "sh /etc/cont-init.d/02-reconcile-profiles",
+        user="root",
+    )
+    assert r.returncode != 0
+    marker = docker_exec_sh(
+        container_name,
+        "test -d /run/hermes && test ! -L /run/hermes && test \"$(stat -c '%u:%g:%a' /run/hermes)\" = 0:0:700 "
+        "&& test -f /run/hermes/container-gateway-run && test ! -L "
+        "/run/hermes/container-gateway-run && test \"$(stat -c '%u:%g:%a' "
+        "/run/hermes/container-gateway-run)\" = 0:0:600",
+        user="root",
+    )
+    assert marker.returncode == 0, "failed reconciliation must retain its diagnostic marker"
+
+
+def test_non_pid1_entrypoint_does_not_create_gateway_marker(
+    built_image: str, container_name: str,
+) -> None:
+    """An externally supplied init makes the dispatcher a child, never a marker writer."""
+    r = subprocess.run(
+        ["docker", "run", "-d", "--init", "--name", container_name, built_image, "sleep", "infinity"],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    absent, _ = poll_container(
+        container_name,
+        "test ! -e /run/hermes/container-gateway-run && test ! -L /run/hermes/container-gateway-run",
+        user="root",
+        deadline_s=30.0,
+    )
+    assert absent, "non-PID1 fallback must not create a pre-init marker"
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("gateway run --no-supervise", id="cli-no-supervise"),
+    pytest.param("gateway run", id="env-no-supervise"),
+])
+def test_entrypoint_does_not_seed_supervised_intent_for_cli_opt_out(
+    built_image: str, container_name: str, cmd: str,
+) -> None:
+    """The CLI opt-out remains foreground rather than seeding a boot marker."""
+    env_args = ("HERMES_GATEWAY_NO_SUPERVISE=1",) if cmd == "gateway run" else ()
+    start_container(built_image, container_name, *env_args, cmd=cmd)
+
+    logs = wait_for_docker_logs(
+        container_name, "reconcile: profile=default prior_state=None action=registered", deadline_s=60.0,
+    )
+    assert "reconcile: profile=default prior_state=None action=registered" in logs
 
 
     # If status == "exited" instead, the gateway exited (also valid

@@ -164,7 +164,15 @@ def _maybe_migrate_legacy_gateway_run_state(
     if os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in ("1", "true", "yes"):
         return None
     argv = tuple(container_argv) if container_argv is not None else _read_container_argv()
-    if not _is_legacy_gateway_run_request(argv):
+    # cont-init runs before s6 launches the CMD, so `/proc` cannot contain
+    # main-wrapper.sh yet. The entrypoint derives its private declaration from
+    # that actual CMD.  Direct/non-s6 callers retain the argv probe; do not
+    # trust an ambient marker when an argv was supplied.
+    declared_gateway_run = (
+        container_argv is None
+        and os.environ.get("HERMES_CONTAINER_GATEWAY_RUN") == "1"
+    )
+    if not declared_gateway_run and not _is_legacy_gateway_run_request(argv):
         return None
     if not dry_run:
         import time
@@ -228,7 +236,8 @@ def _is_legacy_gateway_run_request(argv: Sequence[str]) -> bool:
     args = _strip_container_argv_prefix(argv)
     if "--no-supervise" in args:
         return False
-    return len(args) >= 2 and args[0] == "gateway" and args[1] == "run"
+    from hermes_cli._parser import command_argv
+    return command_argv(args)[:2] == ["gateway", "run"]
 
 
 def _is_dashboard_container(argv: Sequence[str]) -> bool:

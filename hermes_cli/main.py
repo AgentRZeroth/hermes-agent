@@ -574,8 +574,8 @@ def _s6_supervised_gateway_run(argv: list) -> bool:
     registered down, because a started named slot is a second gateway beside the multiplexer.
     ``--no-supervise`` keeps the foreground run, which follows ``active_profile`` as before (#22502).
     """
-    words = [a for a in argv if not a.startswith("-")]
-    if words[:2] != ["gateway", "run"] or "--no-supervise" in argv:
+    from hermes_cli._parser import command_argv
+    if command_argv(argv)[:2] != ["gateway", "run"] or "--no-supervise" in argv:
         return False
     if os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in ("1", "true", "yes"):
         return False

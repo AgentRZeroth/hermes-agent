@@ -42,6 +42,25 @@ if [ -d /run/service/.s6-svscan ]; then
     done
 fi
 
+# The entrypoint's root-private marker bridges the pre-CMD cont-init window.
+# Validate it before using it, expose it only to the reconciler child, and
+# consume it only after successful reconciliation.
+marker=/run/hermes/container-gateway-run
+if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -d /run/hermes ] && [ ! -L /run/hermes ] && \
+        [ "$(stat -c '%u:%g:%a' /run/hermes)" = "0:0:700" ] && \
+        [ -f "$marker" ] && [ ! -L "$marker" ] && \
+        [ "$(stat -c '%u:%g:%a' "$marker")" = "0:0:600" ] || {
+        echo "[hermes] ERROR: invalid pre-init gateway marker: $marker" >&2; exit 1; }
+    export HERMES_CONTAINER_GATEWAY_RUN=1
+else
+    unset HERMES_CONTAINER_GATEWAY_RUN
+fi
+
 # Skip the drop when already non-root.
 [ "$(id -u)" = 0 ] || exec /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
-exec s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+if s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot; then
+    [ -z "${HERMES_CONTAINER_GATEWAY_RUN+x}" ] || rm -f "$marker"
+else
+    exit $?
+fi

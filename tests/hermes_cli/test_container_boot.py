@@ -17,6 +17,7 @@ import pytest
 
 from hermes_cli.container_boot import (
     ReconcileAction,
+    _is_legacy_gateway_run_request,
     reconcile_profile_gateways,
 )
 
@@ -357,3 +358,95 @@ def test_a_stopped_fleet_still_boots_nothing(tmp_path: Path) -> None:
 
     assert [a.action for a in actions] == ["registered"] * 3
     assert not any(a.folded_into_root for a in actions)
+
+
+def test_declared_gateway_run_starts_default_when_existing_home_has_no_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The entrypoint marker reaches cont-init before the CMD exists in /proc.
+
+    A pre-existing Hermes home without runtime state is the upgrade shape that
+    regressed: explicit ``docker run IMAGE gateway run`` is declared intent,
+    while an ordinary no-CMD restart must still respect a persisted stop.
+    ``None`` models cont-init, which has no direct container argv during this
+    pre-CMD window; an explicit argv intentionally does not trust the marker.
+    """
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    (tmp_path / "config.yaml").write_text("# existing Hermes home\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_CONTAINER_GATEWAY_RUN", "1")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False, container_argv=None)
+
+    assert actions == [ReconcileAction(profile="default", prior_state="running", action="started")]
+    state = json.loads((tmp_path / "gateway_state.json").read_text(encoding="utf-8"))
+    assert state["desired_state"] == "running"
+    assert not (scandir / "gateway-default" / "down").exists()
+
+
+def test_declared_gateway_run_does_not_override_persisted_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit CMD only supplies missing legacy state; persisted intent wins."""
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    _seed_default_root(tmp_path, state="stopped")
+    monkeypatch.setenv("HERMES_CONTAINER_GATEWAY_RUN", "1")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=False, container_argv=())
+
+    assert actions == [ReconcileAction(profile="default", prior_state="stopped", action="registered")]
+    assert (scandir / "gateway-default" / "down").exists()
+
+
+@pytest.mark.parametrize("argv", [
+    ("gateway", "run"),
+    ("-p", "coder", "gateway", "run"),
+    ("--profile", "coder", "gateway", "run"),
+    ("--profile=coder", "gateway", "run"),
+    ("--model", "gateway", "gateway", "run"),
+])
+def test_legacy_gateway_run_recognizes_global_cli_options(argv: tuple[str, ...]) -> None:
+    """Global option values must be skipped before identifying the CMD."""
+    assert _is_legacy_gateway_run_request(argv)
+
+
+@pytest.mark.parametrize("argv", [
+    ("-p", "coder", "gateway", "run", "--no-supervise"),
+    ("--profile", "coder", "gateway", "run", "--no-supervise"),
+])
+def test_legacy_gateway_run_no_supervise_is_an_opt_out(argv: tuple[str, ...]) -> None:
+    assert not _is_legacy_gateway_run_request(argv)
+
+
+def test_ambient_gateway_marker_cannot_start_an_unrelated_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the entrypoint-derived marker may cover the pre-CMD s6 window."""
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    monkeypatch.setenv("HERMES_CONTAINER_GATEWAY_RUN", "1")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=True,
+        container_argv=("dashboard",),
+    )
+
+    assert actions == [ReconcileAction(profile="default", prior_state=None, action="registered")]
+
+
+def test_no_supervise_environment_is_an_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    monkeypatch.setenv("HERMES_CONTAINER_GATEWAY_RUN", "1")
+    monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", "true")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=scandir, dry_run=True, container_argv=(),
+    )
+
+    assert actions == [ReconcileAction(profile="default", prior_state=None, action="registered")]

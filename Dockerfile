@@ -423,6 +423,9 @@ RUN set -eu; \
 # /run/service/ (tmpfs) and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+# `type` / `contents.d` declarations have no extension, so a Windows checkout
+# can carry CRLF despite script EOL attributes. s6-rc accepts only LF tokens.
+RUN find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} +
 
 # stage2-hook handles UID/GID remap, volume chown, config seeding,
 # skills sync — all the work the old entrypoint.sh did before
@@ -438,6 +441,9 @@ RUN mkdir -p /etc/cont-init.d && \
     chmod +x /etc/cont-init.d/01-hermes-setup
 COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+# cont-init scripts are extensionless too; normalize checkout EOL before s6
+# parses their interpreter directives.
+RUN find /etc/cont-init.d -type f -exec sed -i 's/\r$//' {} +
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
